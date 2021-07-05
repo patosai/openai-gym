@@ -3,12 +3,14 @@
 import gym
 import matplotlib.pyplot as plt
 import numpy as np
+import sys
 import torch
 
 
 gym_name = 'CartPole-v1'
 model_filename = "cartpole_v1.pt"
 gym_max_steps = 200 # max steps for cartpole is 200
+episodes_in_batch = 2
 
 
 def create_env():
@@ -32,10 +34,14 @@ def create_model(env):
     assert output_size is not None, "implement something to calculate the output_size"
 
     return torch.nn.Sequential(
-        torch.nn.Linear(input_size, input_size*output_size),
-        torch.nn.Linear(input_size*output_size, input_size*output_size),
-        torch.nn.Linear(input_size*output_size, input_size*output_size),
-        torch.nn.Linear(input_size*output_size, output_size),
+        torch.nn.Linear(input_size, input_size),
+        torch.nn.ReLU(),
+        torch.nn.Dropout(p=0.5),
+        torch.nn.Linear(input_size, output_size),
+        torch.nn.ReLU(),
+        torch.nn.Dropout(p=0.5),
+        torch.nn.Linear(output_size, output_size),
+        torch.nn.ReLU(),
         torch.nn.Softmax(dim=0),
     )
 
@@ -91,59 +97,69 @@ def moving_average(x, w):
     return np.convolve(x, np.ones(w), 'valid') / w
 
 
-def train():
+def train(is_incremental_training):
     print("Training")
 
     episode_rewards = []
 
     with create_env() as env:
         model = create_model(env)
+        if is_incremental_training:
+            print("Loading model for incremental training")
+            load_model(model)
 
-        for episode_num in range(1500):
-            observation_gradient_pairs = []
-            observation = env.reset()
+        for batch_num in range(1000):
+            observation_gradient_pairs = [[] for _ in range(episodes_in_batch)]
+            rewards = [0 for _ in range(episodes_in_batch)]
+            for episode_num in range(episodes_in_batch):
+                observation = env.reset()
 
-            total_reward = 0
+                total_reward = 0
 
-            num_steps_taken = gym_max_steps
-            for t in range(gym_max_steps):
-                env.render()
+                num_steps_taken = 0
+                for t in range(gym_max_steps):
+                    env.render()
 
-                observation = torch.Tensor(observation)
-                action, gradient = observation_to_model_action_and_gradient(env, model, observation)
-                observation_gradient_pairs.append([observation, gradient])
-                observation, reward, done, info = env.step(action.item())
+                    observation = torch.Tensor(observation)
+                    action, gradient = observation_to_model_action_and_gradient(env, model, observation)
+                    observation_gradient_pairs[episode_num].append([observation, gradient])
+                    observation, reward, done, info = env.step(action.item())
 
-                total_reward += reward
+                    total_reward += reward
 
-                if done:
-                    num_steps_taken = t+1
-                    break
+                    if done:
+                        num_steps_taken = t+1
+                        rewards[episode_num] = total_reward
+                        break
 
-            print("episode {}, {} timesteps, {} reward".format(episode_num, num_steps_taken, total_reward))
-            if num_steps_taken == gym_max_steps:
-                save_model(model, model_filename)
+            print("episode {}, {} timesteps, {} reward".format(batch_num, num_steps_taken, total_reward))
 
             # update the model
-            if len(episode_rewards) > 0:
-                last_few_episodes = episode_rewards[-5:]
-                previous_average_reward = sum(last_few_episodes)/len(last_few_episodes)
-                difference = total_reward - previous_average_reward
+            average_reward = sum(rewards)/len(rewards)
+            num_parameters = len(list(model.parameters()))
+            with torch.no_grad():
+                parameter_updates = [0 for _ in range(num_parameters)]
+                for episode_num, batch_episode in enumerate(observation_gradient_pairs):
+                    is_above_average = rewards[episode_num] > average_reward
+                    model.zero_grad()
 
-                model.zero_grad()
+                    for observation, gradient in batch_episode:
+                        # compute gradients; stacked calls to .backward() without a zero_grad will sum the gradients
+                        gradient.backward()
 
-                for observation, gradient in observation_gradient_pairs:
-                    # compute gradients; stacked calls to .backward() without a zero_grad will sum the gradients
-                    gradient.backward()
-                with torch.no_grad():
-                    learning_rate = 0.001
-                    max_learning_rate = 0.01
-                    reward_multiplier = learning_rate * difference
+                        learning_rate = 0.001
+                        final_multiplier = learning_rate * (1 if is_above_average else -1)
+                        for idx, param in enumerate(model.parameters()):
+                            if param.requires_grad:
+                                parameter_updates[idx] += final_multiplier * param.grad
 
-                    effective_learning_rate = constrain(reward_multiplier, -1*max_learning_rate, max_learning_rate)
-                    for param in model.parameters():
-                        param += effective_learning_rate * param.grad
-            episode_rewards.append(total_reward)
+                for idx, param in enumerate(model.parameters()):
+                    if param.requires_grad:
+                        param += parameter_updates[idx]
+
+            episode_rewards.append(average_reward)
+
+    save_model(model, model_filename)
 
     plt.subplot(2, 1, 1)
     plot_reward(episode_rewards, "No averaging", show=False)
@@ -181,4 +197,5 @@ def replay():
 
 
 if __name__ == "__main__":
-    train()
+    train_incrementally = (sys.argv[1] == "continue") if len(sys.argv) > 1 else False
+    train(train_incrementally)
